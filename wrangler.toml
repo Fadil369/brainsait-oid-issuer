@@ -1,0 +1,21 @@
+name = "brainsait-oid-issuer"
+main = "src/index.ts"
+compatibility_date = "2026-09-06"
+compatibility_flags = ["nodejs_compat"]
+account_id = "d7b99530559ab4f2545e9bdc72a7ab9b"
+workers_dev = true
+
+routes = [
+  { pattern = "register.brainsait.org", custom_domain = true }
+]
+
+[[kv_namespaces]]
+binding = "OID_REGISTRY"
+id = "07ea6ec79f2f46ebbc8076a2000fcfa9"
+
+[[kv_namespaces]]
+binding = "OID_QUEUE"
+id = "d160972aac6841e3b05d850d400d6066"
+
+[observability]
+enabled = true
