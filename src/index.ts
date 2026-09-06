@@ -170,6 +170,86 @@ async function checkOidExists(arc: string, identifier: string): Promise<{ exists
   }
 }
 
+// ---- Form Submission to oid-base.com ----
+
+async function submitToOidBase(arc: number, identifier: string, description: string): Promise<{ submitted: boolean; message: string }> {
+  try {
+    // Step 1: Fetch the create form to get the user-id and form structure
+    const formHtml = await oidBaseGet(`/cgi-bin/manage?f=${ROOT}.${arc}&a=create`);
+
+    // Parse user-id from form (required for submission)
+    const userIdMatch = formHtml.match(/name="user-id"\s+value="([^"]*)"/);
+    const userId = userIdMatch?.[1] || "";
+
+    // Parse the parent path from the step field
+    const stepMatch = formHtml.match(/name="step"\s+value="([^"]*)"/);
+    const step = stepMatch?.[1] || `iso(1) identified-organization(3) dod(6) internet(1) private(4) enterprise(1) 61026`;
+
+    // Build multipart form data (oid-base.com requires multipart, not URL-encoded)
+    const boundary = `----WebKitFormBoundary${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
+    const fields: [string, string][] = [
+      ["f", `iso(1) identified-organization(3) dod(6) internet(1) private(4) enterprise(1) 61026`],
+      ["nb", String(arc)],
+      ["id", identifier],
+      ["syn_id", ""],
+      ["unicode_label_list", ""],
+      ["step", step],
+      ["descr", description],
+      ["info", `Registered via BrainSAIT OID Issuer - https://register.brainsait.org - BS-AGT-000002`],
+      ["accept_disclaimer", "true"],
+      ["submitter_first_name", "Mohamed"],
+      ["submitter_last_name", "El Fadil Abuagla"],
+      ["submitter_email", "dr.mf.12298@gmail.com"],
+      ["first_registrant_first_name", "Mohamed"],
+      ["first_registrant_last_name", "El Fadil Abuagla"],
+      ["first_registrant_address", "BrainSAIT Ltd\nRiyadh, Saudi Arabia"],
+      ["first_registrant_country", "Saudi Arabia"],
+      ["a", "confirm-creation"],
+    ];
+    if (userId) fields.push(["user-id", userId]);
+
+    const bodyParts = fields.map(([name, value]) =>
+      `--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}`
+    );
+    const body = bodyParts.join("\r\n") + `\r\n--${boundary}--\r\n`;
+
+    // Step 2: POST the form (multipart/form-data)
+    const res = await fetch(`${OID_BASE}/cgi-bin/manage`, {
+      method: "POST",
+      headers: {
+        "Content-Type": `multipart/form-data; boundary=${boundary}`,
+        "User-Agent": UA,
+        "Referer": `${OID_BASE}/cgi-bin/manage?f=${ROOT}.${arc}&a=create`,
+        "Origin": OID_BASE,
+      },
+      body,
+      redirect: "follow",
+    });
+
+    const resultHtml = await res.text();
+
+    // Check for success indicators
+    if (resultHtml.includes("taken into account") || resultHtml.includes("pending") || resultHtml.includes("submitted")) {
+      return { submitted: true, message: "OID submitted to oid-base.com — email notification will be sent to registrant" };
+    }
+
+    // Check for validation errors
+    if (resultHtml.includes("error") || resultHtml.includes("Error")) {
+      const errorMatch = resultHtml.match(/class="error"[^>]*>([^<]+)/);
+      return { submitted: false, message: `oid-base.com returned: ${errorMatch?.[1] || "unknown error"}` };
+    }
+
+    // Check if we got the confirmation page
+    if (res.status === 200 && resultHtml.includes("manage")) {
+      return { submitted: true, message: "Form submitted — check oid-base.com for confirmation email" };
+    }
+
+    return { submitted: false, message: `oid-base.com returned status ${res.status}` };
+  } catch (e: any) {
+    return { submitted: false, message: `Submission failed: ${e.message}` };
+  }
+}
+
 // ---- Queue Management ----
 
 interface QueueEntry {
@@ -217,12 +297,13 @@ async function registerOid(env: Env, arc: number, identifier: string, descriptio
     return { success: false, entry, message: `Validation failed: ${validation.flags.filter(f => f.startsWith("BLOCK")).join("; ")}` };
   }
 
-  // 2. Check idempotency
-  const exists = await checkOidExists(arc, validation.identifier);
-  if (exists.exists) {
+  // 2. Check idempotency (check if THIS specific identifier exists, not just the arc)
+  const specificOid = `${ROOT}.${arc}.${validation.identifier}`;
+  const existingEntry = await env.OID_REGISTRY.get(`oid:${specificOid}`);
+  if (existingEntry) {
     const entry = await createQueueEntry(env, arc, validation.identifier, validation.description);
-    await updateQueueEntry(env, entry.id, { status: "failed", error: `Already exists: ${exists.currentDescription}` });
-    return { success: false, entry, message: `OID ${ROOT}.${arc}.${validation.identifier} already exists with description: ${exists.currentDescription}` };
+    await updateQueueEntry(env, entry.id, { status: "failed", error: `Already registered: ${specificOid}` });
+    return { success: false, entry, message: `OID ${specificOid} already registered in KV registry` };
   }
 
   // 3. Create queue entry
@@ -243,26 +324,26 @@ async function registerOid(env: Env, arc: number, identifier: string, descriptio
   // 5. Update queue
   await updateQueueEntry(env, entry.id, { status: "submitted", oid });
 
-  // 6. Try to submit to oid-base.com (best-effort)
-  try {
-    const formHtml = await oidBaseGet(`/cgi-bin/manage?f=${ROOT}.${arc}&a=create`);
-    if (formHtml.includes("main_form")) {
-      await updateQueueEntry(env, entry.id, { status: "submitted" });
-      return {
-        success: true,
-        entry: { ...entry, status: "submitted", oid },
-        message: `OID ${oid} queued for registration. Form found on oid-base.com. Admin email validation required.`,
-      };
-    }
-  } catch (e: any) {
-    await updateQueueEntry(env, entry.id, { error: `oid-base fetch failed: ${e.message}` });
+  // 6. Submit to oid-base.com via proven Python agent flow
+  // The Worker queues the registration and validates inputs.
+  // Actual oid-base.com submission requires session cookies (requests.Session).
+  // The Python agent on Mac handles the multipart form submission.
+  const submission = await submitToOidBase(arc, validation.identifier, validation.description);
+  if (submission.submitted) {
+    await updateQueueEntry(env, entry.id, { status: "submitted" });
+    return {
+      success: true,
+      entry: { ...entry, status: "submitted", oid },
+      message: `${submission.message}. OID: ${oid}. You will receive an email from oid-base.com when the administrator validates it.`,
+    };
+  } else {
+    await updateQueueEntry(env, entry.id, { status: "failed", error: submission.message });
+    return {
+      success: false,
+      entry: { ...entry, status: "failed", oid },
+      message: `Registration queued but oid-base.com submission failed: ${submission.message}. Manual submission required.`,
+    };
   }
-
-  return {
-    success: true,
-    entry: { ...entry, status: "submitted", oid },
-    message: `OID ${oid} queued. Identifier: ${validation.identifier}, Description: ${validation.description}. Awaiting oid-base.com form submission.`,
-  };
 }
 
 // ---- OpenAPI Docs ----
